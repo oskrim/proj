@@ -12,6 +12,8 @@ import logging_config  # Centralized logging configuration
 from simple_search_engine import SimpleSearchEngine
 from graph_extractor import extract_graph_from_document
 from graph_database import GraphDatabase
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +57,53 @@ def index_document(doc_id: str, title: str, content: str, metadata: Dict[str, An
             # Continue with regular indexing even if graph extraction fails
 
 
-def download_and_index_wikipedia(n_documents: int = 1000, language: str = "en", enable_graph: bool = False, model_name: str = "urchade/gliner_mediumv2.1", device: str = "cpu") -> None:
+def process_single_document(article_data: tuple, enable_graph: bool, model_name: str, device: str, language: str) -> bool:
+    """
+    Process a single document. Thread-safe function for parallel processing.
+
+    Args:
+        article_data: Tuple of (index, article) data
+        enable_graph: Whether to extract and store graph data
+        model_name: Model to use for graph extraction
+        device: Device to run models on
+        language: Language code
+
+    Returns:
+        True if processing succeeded, False otherwise
+    """
+    i, article = article_data
+
+    try:
+        # Extract article data
+        doc_id = article.get('id', str(i))
+        title = article.get('title', '')
+        content = article.get('text', '')
+        url = article.get('url', '')
+
+        # Prepare metadata
+        metadata = {
+            'url': url,
+            'language': language,
+            'source': 'wikipedia',
+        }
+
+        # Skip empty articles
+        if not title or not content:
+            logger.warning(f"Skipping empty article at index {i}")
+            return False
+
+        logger.info(f"Processing: {title}")
+
+        # Index the document (with optional graph extraction)
+        index_document(doc_id, title, content, metadata, enable_graph, model_name, device)
+        return True
+
+    except Exception as e:
+        logger.error(f"Error processing document at index {i}: {e}")
+        return False
+
+
+def download_and_index_wikipedia(n_documents: int = 1000, language: str = "en", enable_graph: bool = False, model_name: str = "urchade/gliner_mediumv2.1", device: str = "cpu", parallel_workers: int = 1) -> None:
     """
     Download and process N most popular Wikipedia pages.
 
@@ -65,6 +113,7 @@ def download_and_index_wikipedia(n_documents: int = 1000, language: str = "en", 
         enable_graph: Whether to extract and store graph data
         model_name: Model to use for graph extraction
         device: Device to run models on (cpu or cuda)
+        parallel_workers: Number of parallel workers (default: 1)
     """
     global graph_db
 
@@ -77,7 +126,9 @@ def download_and_index_wikipedia(n_documents: int = 1000, language: str = "en", 
             graph_db = None
         else:
             logger.info("Graph database connection established. Graph extraction enabled.")
+
     logger.info(f"Loading Wikipedia dataset for language: {language}")
+    logger.info(f"Using {parallel_workers} worker(s) for processing")
 
     try:
         # Load dataset with streaming to avoid downloading everything
@@ -85,38 +136,36 @@ def download_and_index_wikipedia(n_documents: int = 1000, language: str = "en", 
 
         logger.info(f"Starting to process {n_documents} Wikipedia pages...")
 
-        processed = 0
+        # Collect articles for processing
+        articles_to_process = []
         for i, article in enumerate(dataset):
-            if processed >= n_documents:
+            if len(articles_to_process) >= n_documents:
                 break
+            articles_to_process.append((i, article))
 
-            # Extract article data
-            doc_id = article.get('id', str(i))
-            title = article.get('title', '')
-            content = article.get('text', '')
-            url = article.get('url', '')
+        processed = 0
 
-            # Prepare metadata
-            metadata = {
-                'url': url,
-                'language': language,
-                'source': 'wikipedia',
-            }
+        if parallel_workers == 1:
+            # Sequential processing
+            for article_data in articles_to_process:
+                if process_single_document(article_data, enable_graph, model_name, device, language):
+                    processed += 1
+        else:
+            # Parallel processing
+            with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+                # Submit all tasks
+                futures = [
+                    executor.submit(process_single_document, article_data, enable_graph, model_name, device, language)
+                    for article_data in articles_to_process
+                ]
 
-            # Skip empty articles
-            if not title or not content:
-                logger.warning(f"Skipping empty article at index {i}")
-                continue
-
-            logger.info(f"Processing [{processed + 1}/{n_documents}]: {title}")
-
-            try:
-                # Index the document (with optional graph extraction)
-                index_document(doc_id, title, content, metadata, enable_graph, model_name, device)
-                processed += 1
-            except Exception as e:
-                logger.error(f"Error indexing document '{title}': {e}")
-                continue
+                # Collect results
+                for future in futures:
+                    try:
+                        if future.result():
+                            processed += 1
+                    except Exception as e:
+                        logger.error(f"Error in parallel processing: {e}")
 
         logger.info(f"Successfully processed {processed} documents")
 
@@ -160,6 +209,14 @@ def main():
         choices=["cpu", "cuda"],
         help="Device to run models on (default: cpu). Use 'cuda' for GPU acceleration."
     )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of parallel workers for processing documents (default: 1). "
+             "WARNING: Using >1 with --device cuda may cause GPU memory conflicts."
+    )
 
     args = parser.parse_args()
 
@@ -168,7 +225,8 @@ def main():
         language=args.language,
         enable_graph=args.enable_graph,
         model_name=args.model,
-        device=args.device
+        device=args.device,
+        parallel_workers=args.parallel
     )
 
 
